@@ -23,6 +23,7 @@ from functools import wraps
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, Literal
+from datetime import datetime
 
 import anyio
 import nodriver as uc
@@ -176,10 +177,18 @@ def _browser_launch_info() -> dict:
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
+SCRAPING_TOOLS = {
+    "start_browser", "close_browser", "new_page", "navigate_page",
+    "take_snapshot", "click", "click_at", "fill", "fill_form", 
+    "type_text", "press_key", "wait_for", "list_pages", "select_page", "save_har"
+}
+
 class BrowserMCPServer(MCPServer):
     """Expose enabled tools and report expected browser failures through ToolError."""
 
     def __init__(self, *args, **kwargs):
+        # Читаем флаг режима скрапинга из переменных окружения
+        self.scraping_mode = os.environ.get("NODRIVER_FULL_MODE", "").lower() != "true"
         self.enabled_tool_groups = parse_enabled_tool_groups(
             os.environ.get(ENABLED_GROUPS_ENV, "")
         )
@@ -190,11 +199,18 @@ class BrowserMCPServer(MCPServer):
         return group if group and group not in self.enabled_tool_groups else None
 
     async def list_tools(self) -> list[MCPTool]:
-        return [
-            tool
-            for tool in await super().list_tools()
-            if self._disabled_tool_group(tool.name) is None
-        ]
+        tools = await super().list_tools()
+        
+        # Если включен режим скрапинга, оставляем только минимально необходимый набор
+        if self.scraping_mode:
+            tools = [tool for tool in tools if tool.name in SCRAPING_TOOLS]
+        else:
+            tools = [
+                tool
+                for tool in tools
+                if self._disabled_tool_group(tool.name) is None
+            ]
+        return tools
 
     async def call_tool(
         self,
@@ -3611,6 +3627,67 @@ async def list_sessions() -> str:
 
     return "\n".join(lines)
 
+@mcp.tool()
+async def save_har(file_path: str) -> str:
+    """Save all captured network requests to a HAR (HTTP Archive) file.
+    Use this after interacting with the page to export the complete network history.
+    
+    Args:
+        file_path: The path where the HAR file should be saved (e.g., './output.har').
+    """
+    har_log = {
+        "log": {
+            "version": "1.2",
+            "creator": {
+                "name": "nodriver-mcp-har-exporter",
+                "version": "1.0"
+            },
+            "entries": []
+        }
+    }
+    
+    for req in _network_requests:
+        # Сохраняем только завершенные запросы или запросы с явной ошибкой
+        if not req.get("finished") and not req.get("error"):
+            continue
+            
+        entry = {
+            "startedDateTime": datetime.fromtimestamp(req.get("timestamp", 0)).isoformat() + "Z",
+            "time": 0, # Можно доработать для подсчета времени, если есть start/end
+            "request": {
+                "method": req.get("method", "GET"),
+                "url": req.get("url", ""),
+                "httpVersion": "HTTP/1.1",
+                "headers": [{"name": str(k), "value": str(v)} for k, v in req.get("headers", {}).items()],
+                "queryString": [],
+                "cookies": [],
+                "headersSize": -1,
+                "bodySize": len(req.get("post_data", "")) if req.get("post_data") else 0
+            },
+            "response": {
+                "status": req.get("status", 0),
+                "statusText": "OK" if req.get("status") == 200 else "Error",
+                "httpVersion": "HTTP/1.1",
+                "headers": [{"name": str(k), "value": str(v)} for k, v in req.get("response_headers", {}).items()],
+                "cookies": [],
+                "content": {
+                    "size": req.get("encoded_data_length", 0),
+                    "mimeType": req.get("mime_type", "application/octet-stream")
+                },
+                "redirectURL": "",
+                "headersSize": -1,
+                "bodySize": -1
+            },
+            "cache": {},
+            "timings": {"send": 0, "wait": 0, "receive": 0}
+        }
+        har_log["log"]["entries"].append(entry)
+        
+    target = Path(file_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(har_log, indent=2, ensure_ascii=False), encoding="utf-8")
+    
+    return f"HAR file successfully saved to {target} with {len(har_log['log']['entries'])} network entries."
 
 # ---------------------------------------------------------------------------
 # Entry point
